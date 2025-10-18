@@ -7,12 +7,38 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from sklearn.utils.class_weight import compute_class_weight
 import torch.nn.functional as F
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 # Qiskit imports
 from qiskit import QuantumCircuit
 from qiskit.circuit.library import UGate, RYYGate, RXXGate
 from qiskit.quantum_info import Statevector, Operator
 from qiskit_aer import Aer
+
+def initialize_w0_with_pca(x_train, n_components=18):
+    """
+    Performs PCA on the training data to generate intelligent initial parameters for the first layer.
+    """
+    print("\nInitializing first layer parameters with PCA...")
+    # It's best practice to scale data before PCA
+    scaler = StandardScaler()
+    x_train_scaled = scaler.fit_transform(x_train)
+    
+    # Fit PCA and get the principal components
+    pca = PCA(n_components=n_components)
+    pca.fit(x_train_scaled)
+    
+    # The components represent the directions of maximum variance.
+    # We use their magnitude (L2 norm) as a proxy for their importance.
+    component_magnitudes = np.linalg.norm(pca.components_, axis=1)
+    
+    # Scale these magnitudes to a suitable range for angles [0, PI]
+    param_scaler = MinMaxScaler(feature_range=(0, np.pi))
+    w0_pca_initialized = param_scaler.fit_transform(component_magnitudes.reshape(-1, 1)).flatten()
+    
+    print(f"PCA initialization complete. Generated {len(w0_pca_initialized)} parameters.")
+    return w0_pca_initialized
 
 def load_breastmnist_data(num_train=400, num_test=100):
     """Load and preprocess BreastMNIST data"""
@@ -71,96 +97,63 @@ def amplitude_embedding_block(features, num_qubits, pad_with=0.0, label="AmpEmbe
 
 def create_qcnn_circuit_from_diagram(features, params, num_qubits=6):
     """
-    Create QCNN circuit based on the provided diagram architecture
-    The diagram shows: Amplitude encoding -> U gates -> RYY/RXX -> Pooling -> Dense layers
+    Creates the QCNN circuit that perfectly matches the provided diagram (54 parameters).
     """
     qc = QuantumCircuit(num_qubits)
     
     # 1. Amplitude Embedding
-    embed_gate = amplitude_embedding_block(features, num_qubits)
-    qc.append(embed_gate, range(num_qubits))
+    norm = np.linalg.norm(features)
+    if np.isclose(norm, 0):
+        norm_features = np.zeros(2**num_qubits); norm_features[0] = 1.0
+    else:
+        norm_features = features / norm
+    qc.initialize(norm_features, range(num_qubits))
     qc.barrier()
     
-    # Parse parameters for different layers
-    # Based on the diagram, we have U gates with 3 parameters, RYY/RXX with 1 parameter each
     param_idx = 0
-    
-    # 2. First U Gate Layer (6 U gates for 6 qubits)
-    u_params1 = []
+
+    # 2. First Convolutional Layer (18 params)
     for i in range(num_qubits):
-        if param_idx + 2 < len(params):
-            u_gate = UGate(params[param_idx], params[param_idx+1], params[param_idx+2])
-            qc.append(u_gate, [i])
-            u_params1.append([params[param_idx], params[param_idx+1], params[param_idx+2]])
-            param_idx += 3
+        qc.u(params[param_idx], params[param_idx+1], params[param_idx+2], i)
+        param_idx += 3
+    qc.barrier()
+
+    # 3. First Pooling Layer (2 params)
+    qc.cx(2, 1); qc.p(params[param_idx], 1); param_idx += 1
+    qc.cx(4, 3); qc.p(params[param_idx], 3); param_idx += 1
     qc.barrier()
     
-    # 3. RYY Gate Layer (entangling gates)
-    ryy_params = []
-    for i in range(0, num_qubits-1, 2):
-        if param_idx < len(params):
-            ryy_gate = RYYGate(params[param_idx])
-            qc.append(ryy_gate, [i, i+1])
-            ryy_params.append(params[param_idx])
-            param_idx += 1
+    active_qubits_l2 = [0, 1, 3, 5]
+
+    # 4. Second Convolutional Layer (18 params)
+    for i in active_qubits_l2:
+        qc.u(params[param_idx], params[param_idx+1], params[param_idx+2], i)
+        param_idx += 3
+    qc.append(UGate(params[param_idx], params[param_idx+1], params[param_idx+2]).control(1), [0, 1]); param_idx += 3
+    qc.append(UGate(params[param_idx], params[param_idx+1], params[param_idx+2]).control(1), [3, 5]); param_idx += 3
+    qc.barrier()
+
+    # 5. Second Pooling Layer (1 param)
+    qc.cx(3, 1); qc.p(params[param_idx], 1); param_idx += 1
     qc.barrier()
     
-    # 4. Second U Gate Layer
-    u_params2 = []
-    for i in range(num_qubits):
-        if param_idx + 2 < len(params):
-            u_gate = UGate(params[param_idx], params[param_idx+1], params[param_idx+2])
-            qc.append(u_gate, [i])
-            u_params2.append([params[param_idx], params[param_idx+1], params[param_idx+2]])
-            param_idx += 3
+    active_qubits_final = [0, 1]
+    
+    # 6. Dense Layer (15 params) - CORRECTED
+    # First set of U gates
+    for i in active_qubits_final:
+        qc.u(params[param_idx], params[param_idx+1], params[param_idx+2], i)
+        param_idx += 3
+    # Controlled-U gate
+    qc.append(UGate(params[param_idx], params[param_idx+1], params[param_idx+2]).control(1), [0, 1])
+    param_idx += 3
+    # Second set of U gates (was missing from original code)
+    for i in active_qubits_final:
+        qc.u(params[param_idx], params[param_idx+1], params[param_idx+2], i)
+        param_idx += 3
     qc.barrier()
-    
-    # 5. Pooling Layer (based on diagram - reduce from 6 to 3 qubits)
-    # This is a simplified pooling - in practice you'd use measurement and conditional operations
-    # For simulation, we'll use controlled rotations as pooling
-    pool_params = []
-    for i in range(0, num_qubits-1, 2):
-        if param_idx < len(params):
-            # Controlled rotation as pooling mechanism
-            qc.cry(params[param_idx], i, i+1)
-            pool_params.append(params[param_idx])
-            param_idx += 1
-    qc.barrier()
-    
-    # After pooling, we continue with remaining qubits (0, 2, 4)
-    remaining_qubits = [0, 2, 4]
-    
-    # 6. Third U Gate Layer on remaining qubits
-    u_params3 = []
-    for i in remaining_qubits:
-        if param_idx + 2 < len(params):
-            u_gate = UGate(params[param_idx], params[param_idx+1], params[param_idx+2])
-            qc.append(u_gate, [i])
-            u_params3.append([params[param_idx], params[param_idx+1], params[param_idx+2]])
-            param_idx += 3
-    qc.barrier()
-    
-    # 7. RXX Gate Layer on remaining qubits
-    rxx_params = []
-    for i in range(len(remaining_qubits)-1):
-        if param_idx < len(params):
-            rxx_gate = RXXGate(params[param_idx])
-            qc.append(rxx_gate, [remaining_qubits[i], remaining_qubits[i+1]])
-            rxx_params.append(params[param_idx])
-            param_idx += 1
-    qc.barrier()
-    
-    # 8. Final U Gate Layer (dense layer equivalent)
-    u_params_final = []
-    for i in remaining_qubits:
-        if param_idx + 2 < len(params):
-            u_gate = UGate(params[param_idx], params[param_idx+1], params[param_idx+2])
-            qc.append(u_gate, [i])
-            u_params_final.append([params[param_idx], params[param_idx+1], params[param_idx+2]])
-            param_idx += 3
     
     return qc
-
 class QuantumCircuitFunction(torch.autograd.Function):
     @staticmethod
     def _run_circuit(features, params):
@@ -246,7 +239,60 @@ class DiagramQCNN(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(32, num_classes)
         )
+    def initialize_w0_with_pca(x_train, n_components=18):
+        """
+        Performs PCA on the training data to generate intelligent initial parameters for the first layer.
+        """
+        print("\nInitializing first layer parameters with PCA...")
+        # It's best practice to scale data before PCA
+        scaler = StandardScaler()
+        x_train_scaled = scaler.fit_transform(x_train)
         
+        # Fit PCA and get the principal components
+        pca = PCA(n_components=n_components)
+        pca.fit(x_train_scaled)
+        
+        # The components represent the directions of maximum variance.
+        # We use their magnitude (L2 norm) as a proxy for their importance.
+        component_magnitudes = np.linalg.norm(pca.components_, axis=1)
+        
+        # Scale these magnitudes to a suitable range for angles [0, PI]
+        param_scaler = MinMaxScaler(feature_range=(0, np.pi))
+        w0_pca_initialized = param_scaler.fit_transform(component_magnitudes.reshape(-1, 1)).flatten()
+        
+        print(f"PCA initialization complete. Generated {len(w0_pca_initialized)} parameters.")
+
+
+        return w0_pca_initialized
+    def load_weights_with_pca_init(self, w0_pca, w1_pretrained, w_dense_pretrained):
+        """
+        Loads a hybrid set of weights: PCA-initialized for layer 1,
+        and pretrained for deeper layers.
+        """
+        w0_tensor = torch.tensor(w0_pca, dtype=torch.float32)
+        w1_tensor = torch.tensor(w1_pretrained, dtype=torch.float32)
+        w_dense_tensor = torch.tensor(w_dense_pretrained, dtype=torch.float32)
+        
+        # Initialize the 3 missing pooling parameters with small random values
+        pool1_params = torch.rand(2) * 0.1 * np.pi
+        pool2_params = torch.rand(1) * 0.1 * np.pi
+        
+        # Combine all weights into a single 54-parameter tensor in the correct order
+        combined_weights = torch.cat([
+            w0_tensor,          # PCA-initialized layer 1 (18 params)
+            pool1_params,       # Randomly initialized pooling (2 params)
+            w1_tensor,          # Pretrained layer 2 (18 params)
+            pool2_params,       # Randomly initialized pooling (1 param)
+            w_dense_tensor      # Pretrained dense layer (15 params)
+        ])
+        
+        # Load into quantum layer
+        with torch.no_grad():
+            self.quantum_layer.params.data = combined_weights
+            
+        print("Hybrid weights (PCA + Pretrained) loaded successfully!")
+        print(f"Total parameters in model: {len(combined_weights)}")
+
     def forward(self, x):
         x = x.view(x.size(0), -1)
         x = self.pre_net(x)
@@ -254,6 +300,37 @@ class DiagramQCNN(nn.Module):
         x = x.unsqueeze(1)
         x = self.classical_layer(x)
         return x
+
+    def load_pretrained_quantum_weights(self, w0, w1, w_dense):
+        """
+        Loads pretrained weights and initializes missing pooling parameters.
+        The final parameter order is:
+        [w0 (18), pool1 (2), w1 (18), pool2 (1), w_dense (15)]
+        """
+        # Convert numpy arrays to torch tensors
+        w0_tensor = torch.tensor(w0, dtype=torch.float32)
+        w1_tensor = torch.tensor(w1, dtype=torch.float32)
+        w_dense_tensor = torch.tensor(w_dense, dtype=torch.float32)
+        
+        # Initialize the 3 missing pooling parameters with small random values
+        pool1_params = torch.rand(2) * 0.1 * np.pi
+        pool2_params = torch.rand(1) * 0.1 * np.pi
+        
+        # Combine all weights into a single 54-parameter tensor in the correct order
+        combined_weights = torch.cat([
+            w0_tensor,      # Params 0-17
+            pool1_params,   # Params 18-19
+            w1_tensor,      # Params 20-37
+            pool2_params,   # Param 38
+            w_dense_tensor  # Params 39-53
+        ])
+        
+        # Load into quantum layer
+        with torch.no_grad():
+            self.quantum_layer.params.data = combined_weights
+            
+        print("Pretrained quantum weights loaded successfully!")
+        print(f"Total parameters in model: {len(combined_weights)}")
 
 class FocalLoss(nn.Module):
     """Focal Loss for addressing class imbalance"""
@@ -307,80 +384,106 @@ def calculate_metrics(predictions, targets):
     
     return precision, recall, f1, accuracy
 
-# Configuration based on the diagram architecture
+# Configuration based on the pretrained weights
 NUM_QUBITS = 6
-# Parameter count based on the diagram:
-# 6 U gates (3 params each) = 18
-# 3 RYY gates (1 param each) = 3  
-# 6 U gates (3 params each) = 18
-# 3 Pooling gates (1 param each) = 3
-# 3 U gates (3 params each) = 9
-# 2 RXX gates (1 param each) = 2
-# 3 U gates (3 params each) = 9
-# Total = 18 + 3 + 18 + 3 + 9 + 2 + 9 = 62 parameters
-NUM_QUANTUM_PARAMS = 62
+# The pretrained weights have: 18 + 18 + 15 = 51 parameters
+NUM_QUANTUM_PARAMS = 54  # Updated to match pretrained weights
 NUM_CLASSES = 2
-BATCH_SIZE = 8  # Reduced for quantum simulation
+BATCH_SIZE = 8
 EPOCHS = 15
-LEARNING_RATE = 0.001
-
+LEARNING_RATE = 0.0005
 def visualize_circuit():
-    """Visualize the QCNN circuit architecture"""
-    # Create a sample circuit with random parameters
-    sample_features = np.random.randn(64)
-    sample_params = np.random.randn(NUM_QUANTUM_PARAMS) * 0.1
-    
-    qc = create_qcnn_circuit_from_diagram(sample_features, sample_params)
-    
-    print("QCNN Circuit Architecture:")
-    print("=" * 50)
-    print(f"Total qubits: {NUM_QUBITS}")
-    print(f"Total quantum parameters: {NUM_QUANTUM_PARAMS}")
-    print(f"Circuit depth: {qc.depth()}")
-    print(f"Circuit operations: {qc.count_ops()}")
-    print("\nCircuit structure:")
-    print(qc.draw(output='text'))
-    
-    return qc
+    """Visualize the QCNN circuit architecture with a full set of 54 parameters."""
+    try:
+        # Load pretrained weights
+        data = np.load("qcnn_pretrained_breastmnist_n20.npz")
+        w0 = data["weights_layer0"]      # 18 params
+        w1 = data["weights_layer1"]      # 18 params
+        w_dense = data["dense_weights"]  # 15 params
 
+        # --- CORRECTED SECTION ---
+        # Create the full 54-parameter array by adding pooling parameters,
+        # mimicking the logic from the load_pretrained_quantum_weights method.
+        pool1_params = np.random.rand(2) * 0.1 * np.pi  # 2 params for the first pooling layer
+        pool2_params = np.random.rand(1) * 0.1 * np.pi  # 1 param for the second pooling layer
+
+        sample_params = np.concatenate([
+            w0,
+            pool1_params,
+            w1,
+            pool2_params,
+            w_dense
+        ])
+        # --- END CORRECTION ---
+
+        sample_features = np.random.randn(64)
+
+        # This call will now succeed as sample_params has the correct size of 54
+        qc = create_qcnn_circuit_from_diagram(sample_features, sample_params)
+
+        print("QCNN Circuit Architecture with Pretrained Weights:")
+        print("=" * 50)
+        print(f"Total qubits: {NUM_QUBITS}")
+        print(f"Total quantum parameters: {NUM_QUANTUM_PARAMS}")
+        print(f"Circuit depth: {qc.depth()}")
+        print(f"Circuit operations: {qc.count_ops()}")
+        print("\nCircuit structure:")
+        # Using fold=-1 to prevent the text diagram from wrapping
+        print(qc.draw(output='text', fold=-1))
+        print("=" * 50)
+
+        return qc
+
+    except FileNotFoundError:
+        print("❌ Cannot visualize circuit: Pretrained weights file not found.")
+        return None
+    except Exception as e:
+        print(f"❌ An error occurred during circuit visualization: {e}")
+        return None
 def main():
     print("Loading BreastMNIST data...")
-    x_train, y_train, x_test, y_test = load_breastmnist_data(num_train=200, num_test=50)
+    # It's recommended to use more data for PCA to be effective
+    x_train, y_train, x_test, y_test = load_breastmnist_data(num_train=554, num_test=156)
     
     # Analyze class distribution
     train_unique, train_counts = np.unique(y_train, return_counts=True)
     print(f"Training set class distribution: Class {train_unique[0]}: {train_counts[0]}, Class {train_unique[1]}: {train_counts[1]}")
-    print(f"Imbalance ratio: {max(train_counts)/min(train_counts):.2f}:1")
     
-    # Visualize the circuit architecture
-    print("\n" + "="*60)
-    print("QCNN CIRCUIT ARCHITECTURE")
-    print("="*60)
+    # --- MODIFICATION START ---
+
+    # 1. Generate the first layer's weights using PCA on the training data
+    w0_pca = initialize_w0_with_pca(x_train)
+    
+    # 2. Load the PRETRAINED weights for the other layers
+    print("\nLoading PRETRAINED weights for deeper layers...")
+    try:
+        data = np.load("qcnn_pretrained_breastmnist_n20.npz")
+        # We no longer need w0 from this file
+        w1 = data["weights_layer1"]
+        w_dense = data["dense_weights"]
+        print("Pretrained weights for w1 and w_dense loaded.")
+        
+    except FileNotFoundError:
+        print("❌ Pretrained weights file 'qcnn_pretrained_breastmnist_n20.npz' not found!")
+        return
+    
+    # Visualize the circuit (this remains the same)
     visualize_circuit()
     
-    # Compute class weights for loss function
-    class_weights = compute_class_weight(
-        'balanced',
-        classes=np.unique(y_train),
-        y=y_train
-    )
+    # ... (code for class_weights, dataloaders remains the same) ...
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     class_weights = torch.tensor(class_weights, dtype=torch.float32)
-    print(f"\nClass weights for loss function: {class_weights}")
-    
-    # Convert test data
-    x_test_tensor = torch.FloatTensor(x_test)
-    y_test_tensor = torch.LongTensor(y_test)
-    test_dataset = TensorDataset(x_test_tensor, y_test_tensor)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
-    
-    # Create balanced training loader
+    test_loader = DataLoader(TensorDataset(torch.FloatTensor(x_test), torch.LongTensor(y_test)), batch_size=BATCH_SIZE)
     train_loader = create_balanced_dataloader(x_train, y_train, BATCH_SIZE)
-    
+
     # Initialize model
     model = DiagramQCNN(
         num_quantum_params=NUM_QUANTUM_PARAMS,
         num_classes=NUM_CLASSES
     )
+    
+    # 3. Use the NEW loading method with the hybrid weights
+    model.load_weights_with_pca_init(w0_pca, w1, w_dense)
     
     print(f"\nModel Configuration:")
     print(f"  - Quantum parameters: {NUM_QUANTUM_PARAMS}")
@@ -399,7 +502,7 @@ def main():
         'precision': [], 'recall': [], 'f1': []
     }
     
-    print("\nStarting QCNN training with diagram-based architecture...")
+    print("\nStarting QCNN training with PRETRAINED quantum weights...")
     print("=" * 60)
     
     for epoch in range(EPOCHS):
@@ -485,7 +588,7 @@ def main():
     plt.subplot(1, 4, 1)
     plt.plot(history['train_loss'], label='Training Loss')
     plt.plot(history['val_loss'], label='Validation Loss')
-    plt.title('Loss vs Epochs')
+    plt.title('Loss vs Epochs (With Pretrained Weights)')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
@@ -494,7 +597,7 @@ def main():
     plt.subplot(1, 4, 2)
     plt.plot(history['train_acc'], label='Training Accuracy')
     plt.plot(history['val_acc'], label='Validation Accuracy')
-    plt.title('Accuracy vs Epochs')
+    plt.title('Accuracy vs Epochs (With Pretrained Weights)')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy (%)')
     plt.legend()
@@ -504,7 +607,7 @@ def main():
     plt.plot(history['precision'], label='Precision')
     plt.plot(history['recall'], label='Recall')
     plt.plot(history['f1'], label='F1-Score')
-    plt.title('Metrics vs Epochs')
+    plt.title('Metrics vs Epochs (With Pretrained Weights)')
     plt.xlabel('Epoch')
     plt.ylabel('Score')
     plt.legend()
@@ -523,7 +626,7 @@ def main():
     
     # Final evaluation
     print("\n" + "="*60)
-    print("FINAL QCNN RESULTS - DIAGRAM ARCHITECTURE")
+    print("FINAL QCNN RESULTS - WITH PRETRAINED QUANTUM WEIGHTS")
     print("="*60)
     print(f"Final Training Accuracy: {history['train_acc'][-1]:.2f}%")
     print(f"Final Validation Accuracy: {history['val_acc'][-1]:.2f}%")
